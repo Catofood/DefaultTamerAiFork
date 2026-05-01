@@ -1,0 +1,332 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      XCODE_VERSION: "26.3"
+      EXPECTED_MACOSX_DEPLOYMENT_TARGET: "13.0"
+    
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+          token: ${{ secrets.SCRIPTS_DEPLOY_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Verify Xcode version
+        run: xcodebuild -version
+      
+      - name: Read version from VERSION.txt
+        id: version
+        run: |
+          VERSION=$(cat VERSION.txt | tr -d '[:space:]')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Tag version: v$VERSION"
+      
+      - name: Setup certificate
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Create variables
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          
+          # Decode certificate from base64
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode --output $CERTIFICATE_PATH
+          
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security default-keychain -s $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          
+          # Import certificate to keychain
+          security import $CERTIFICATE_PATH -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          # Import Apple intermediate certificates required to build the full
+          # Developer ID signing chain. Without these, codesign produces a
+          # chain-less signature that Apple notarization rejects as "invalid".
+          curl -fsSL https://www.apple.com/certificateauthority/DeveloperIDCA.cer \
+            -o $RUNNER_TEMP/DeveloperIDCA.cer
+          security import $RUNNER_TEMP/DeveloperIDCA.cer -k $KEYCHAIN_PATH -T /usr/bin/codesign || true
+          
+          # Allow codesign to use the keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Diagnostic: list available signing identities
+          echo "--- Available codesigning identities ---"
+          security find-identity -v -p codesigning $KEYCHAIN_PATH || true
+      
+      - name: Install XcodeGen and generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Validate deployment target
+        run: |
+          TARGETS=$(xcodebuild -project DefaultTamer.xcodeproj \
+            -scheme DefaultTamer \
+            -configuration Release \
+            -showBuildSettings | \
+            sed -n 's/^[[:space:]]*MACOSX_DEPLOYMENT_TARGET = //p' | sort -u)
+
+          echo "Detected MACOSX_DEPLOYMENT_TARGET values:"
+          echo "$TARGETS"
+
+          COUNT=$(echo "$TARGETS" | sed '/^$/d' | wc -l | tr -d '[:space:]')
+          if [ "$COUNT" -ne 1 ] || [ "$TARGETS" != "$EXPECTED_MACOSX_DEPLOYMENT_TARGET" ]; then
+            echo "::error::Unexpected deployment target. Expected $EXPECTED_MACOSX_DEPLOYMENT_TARGET, got: $TARGETS"
+            exit 1
+          fi
+
+      - name: Build and sign
+        env:
+          DEVELOPER_ID_NAME: ${{ secrets.DEVELOPER_ID_NAME }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          # Create build directory
+          mkdir -p build dist
+
+          # Build without code signing — we sign all binaries manually below so
+          # that OTHER_CODE_SIGN_FLAGS (--timestamp) is applied uniformly to
+          # every binary including Sparkle's nested helpers, which xcodebuild
+          # would sign in its own phase without propagating our flags.
+          xcodebuild -scheme DefaultTamer \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            -arch arm64 \
+            -arch x86_64 \
+            MARKETING_VERSION=${{ steps.version.outputs.version }} \
+            CURRENT_PROJECT_VERSION=${{ steps.version.outputs.version }} \
+            ONLY_ACTIVE_ARCH=NO \
+            DEPLOYMENT_POSTPROCESSING=YES \
+            STRIP_INSTALLED_PRODUCT=YES \
+            DEAD_CODE_STRIPPING=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          # Use ditto (not cp -r) to preserve symlinks and macOS bundle structure
+          ditto build/DerivedData/Build/Products/Release/DefaultTamer.app build/DefaultTamer.app
+
+          APP="build/DefaultTamer.app"
+          SFB="$APP/Contents/Frameworks/Sparkle.framework/Versions/B"
+
+          # Helper: re-sign a Sparkle component while preserving its original
+          # embedded entitlements. Sparkle's XPCServices come pre-signed in the
+          # SPM distribution — --preserve-metadata=entitlements re-applies their
+          # existing entitlements (e.g. com.apple.security.parent-application-is-sandboxed
+          # on Installer.xpc) so macOS will launch the XPC for the sandboxed parent app.
+          # NOTE: Do NOT use 'codesign -d --entitlements :file' to extract and re-apply
+          # entitlements — the build runs CODE_SIGNING_ALLOWED=NO so components are
+          # unsigned in the build output; extraction would silently produce an empty
+          # file, causing entitlements to be stripped.
+          sign_sparkle_component() {
+            local component="$1"
+            codesign --force --sign "$DEVELOPER_ID_NAME" \
+              --options runtime --timestamp \
+              --preserve-metadata=entitlements \
+              "${component}"
+          }
+
+          # Sign Sparkle content inner-to-outer (required order)
+          for xpc in "$SFB/XPCServices/"*.xpc; do
+            [ -d "$xpc" ] && sign_sparkle_component "$xpc"
+          done
+          for helper in "$SFB/Autoupdate" "$SFB/Updater.app"; do
+            [ -e "$helper" ] && sign_sparkle_component "$helper"
+          done
+          codesign --force --sign "$DEVELOPER_ID_NAME" --options runtime --timestamp "$SFB"
+
+          # Sign the main app (with entitlements)
+          codesign --force --sign "$DEVELOPER_ID_NAME" --options runtime --timestamp \
+            --entitlements DefaultTamer/DefaultTamer.entitlements \
+            "$APP"
+
+          # Verify
+          codesign --verify --deep --strict "$APP"
+          echo "Code signing OK"
+
+          # Diagnostic: show what cert was actually used to sign
+          echo "--- Signing identity used for main binary ---"
+          codesign -dv "$APP/Contents/MacOS/DefaultTamer" 2>&1 | grep -E "Authority|Timestamp|TeamIdentifier|Identifier" || true
+          echo "--- Signing identity used for Sparkle dylib ---"
+          codesign -dv "$APP/Contents/Frameworks/Sparkle.framework/Sparkle" 2>&1 | grep -E "Authority|Timestamp|TeamIdentifier" || true
+      
+      - name: Create DMG
+        run: |
+          bash private/scripts/create-dmg.sh build/DefaultTamer.app dist/DefaultTamer-v${{ steps.version.outputs.version }}.dmg
+
+      - name: Verify DMG signatures before notarization
+        run: |
+          DMG="dist/DefaultTamer-v${{ steps.version.outputs.version }}.dmg"
+          hdiutil attach "$DMG" -mountpoint /tmp/notarize-verify -nobrowse -readonly
+          echo "--- Verifying app signatures inside DMG ---"
+          codesign --verify --deep --strict "/tmp/notarize-verify/DefaultTamer.app" && echo "✅ DMG signatures valid" || echo "❌ DMG signatures BROKEN"
+          codesign -dv --verbose=4 "/tmp/notarize-verify/DefaultTamer.app/Contents/MacOS/DefaultTamer" 2>&1 | grep -E "Authority|Timestamp|TeamIdentifier|Identifier|Format" || true
+          echo "--- Sparkle dylib ---"
+          codesign -dv --verbose=4 "/tmp/notarize-verify/DefaultTamer.app/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle" 2>&1 | grep -E "Authority|Timestamp|TeamIdentifier|Identifier|Format" || true
+          echo "--- Installer.xpc entitlements (must include parent-application-is-sandboxed) ---"
+          codesign -d --entitlements :- "/tmp/notarize-verify/DefaultTamer.app/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc" 2>&1 || echo "❌ Installer.xpc not signed or missing"
+          hdiutil detach /tmp/notarize-verify
+
+      - name: Notarize app
+        env:
+          APPLE_ID_USER: ${{ secrets.APPLE_ID_USER }}
+          APPLE_ID_TEAM: ${{ secrets.APPLE_ID_TEAM }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+        run: |
+          DMG="dist/DefaultTamer-v${{ steps.version.outputs.version }}.dmg"
+
+          # Submit and capture output to extract submission ID for log fetching
+          NOTARY_OUTPUT=$(xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID_USER" \
+            --team-id "$APPLE_ID_TEAM" \
+            --password "$APPLE_ID_PASSWORD" \
+            --wait 2>&1)
+          echo "$NOTARY_OUTPUT"
+
+          SUBMISSION_ID=$(echo "$NOTARY_OUTPUT" | grep -E "^\s+id:" | head -1 | awk '{print $2}')
+
+          # If notarization was rejected, fetch and print Apple's detailed log
+          if echo "$NOTARY_OUTPUT" | grep -q "status: Invalid"; then
+            echo "::error::Notarization rejected — fetching Apple's rejection log..."
+            if [ -n "$SUBMISSION_ID" ]; then
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --apple-id "$APPLE_ID_USER" \
+                --team-id "$APPLE_ID_TEAM" \
+                --password "$APPLE_ID_PASSWORD" 2>&1 || true
+            fi
+            exit 1
+          fi
+
+          # Staple the notarization ticket to the DMG
+          xcrun stapler staple "$DMG"
+      
+      - name: Verify notarization
+        run: |
+          xcrun stapler validate dist/DefaultTamer-v${{ steps.version.outputs.version }}.dmg
+      
+      - name: Extract release notes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Extract from the versioned heading [VERSION] — this is always populated
+          # in CHANGELOG.md (either pre-existing or promoted from [Unreleased] in
+          # the same run). Using [Unreleased] was fragile: on retries the section
+          # is already empty because the first run already promoted it.
+          awk "/^## \\[$VERSION\\]/{found=1; next} found && /^## \\[/{exit} found{print}" \
+            CHANGELOG.md > /tmp/release-notes.md
+          # Trim leading blank lines
+          sed -i '' '/./,$!d' /tmp/release-notes.md
+          echo "--- Release notes preview ---"
+          cat /tmp/release-notes.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/DefaultTamer-v${{ steps.version.outputs.version }}.dmg
+          body_path: /tmp/release-notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update website release data
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DATE=$(date -u +%Y-%m-%d)
+          DMG_PATH="dist/DefaultTamer-v${VERSION}.dmg"
+
+          # Sign the DMG for Sparkle using the EdDSA private key (base64-encoded)
+          # stored in the SPARKLE_PRIVATE_KEY repository secret.
+          ED_SIGNATURE="PLACEHOLDER"
+          DMG_SIZE=0
+          if [ -f "$DMG_PATH" ]; then
+            DMG_SIZE=$(stat -f%z "$DMG_PATH")
+            # sign_update is in SPM artifacts resolved during the build step
+            SPARKLE_SIGN_TOOL=$(find build/DerivedData/SourcePackages/artifacts -name "sign_update" -not -path "*/old_dsa_scripts/*" 2>/dev/null | head -1 || true)
+            if [ -z "$SPARKLE_SIGN_TOOL" ]; then
+              SPARKLE_SIGN_TOOL=$(find ~/Library/Developer/Xcode/DerivedData -name "sign_update" -not -path "*/old_dsa_scripts/*" 2>/dev/null | head -1 || true)
+            fi
+            echo "sign_update tool: ${SPARKLE_SIGN_TOOL:-NOT FOUND}"
+            if [ -n "$SPARKLE_SIGN_TOOL" ] && [ -n "$SPARKLE_PRIVATE_KEY" ]; then
+              echo "$SPARKLE_PRIVATE_KEY" | base64 --decode > /tmp/sparkle_private_key
+              SIGN_OUTPUT=$("$SPARKLE_SIGN_TOOL" --ed-key-file /tmp/sparkle_private_key "$DMG_PATH" 2>&1)
+              echo "sign_update output: $SIGN_OUTPUT"
+              ED_SIGNATURE=$(echo "$SIGN_OUTPUT" | grep -oE 'sparkle:edSignature="[^"]+"' | sed 's/sparkle:edSignature="//;s/"//' || true)
+              if [ -z "$ED_SIGNATURE" ]; then
+                # Fallback: try matching a long base64 string
+                ED_SIGNATURE=$(echo "$SIGN_OUTPUT" | grep -oE '[A-Za-z0-9+/=]{80,}' | head -1 || true)
+              fi
+              rm -f /tmp/sparkle_private_key
+              echo "EdDSA signature: ${ED_SIGNATURE:-FAILED}"
+            else
+              echo "::warning::Sparkle signing skipped — sign_update or SPARKLE_PRIVATE_KEY not available"
+            fi
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/0xdps/default-tamer.git"
+          git fetch origin trunk
+          git checkout -f trunk
+          jq -n \
+            --arg version "${VERSION}" \
+            --arg downloadUrl "/download/DefaultTamer-v${VERSION}.dmg" \
+            --arg releaseDate "${DATE}" \
+            --arg releaseNotesUrl "https://www.defaulttamer.app/release-notes" \
+            --arg edSignature "${ED_SIGNATURE}" \
+            --argjson size "${DMG_SIZE}" \
+            '{version: $version, downloadUrl: $downloadUrl, releaseDate: $releaseDate, releaseNotesUrl: $releaseNotesUrl, edSignature: $edSignature, size: $size}' \
+            > DefaultTamerWeb/src/data/release.json
+          # Promote [Unreleased] section to versioned entry in CHANGELOG.md.
+          # Guard: only insert if ## [VERSION] doesn't already exist (idempotent
+          # on retries / re-runs of the same tag).
+          if ! grep -qF "## [$VERSION]" CHANGELOG.md; then
+            perl -i -pe "s/## \[Unreleased\]/## [Unreleased]\n\n## [$VERSION] - $DATE/" CHANGELOG.md
+          fi
+
+          # Promote the user-facing changelog entry from "upcoming" to released:
+          # - Replace the 9.9.9 placeholder version with the real version
+          # - Remove the isUnreleased: true flag
+          CONTENT_CHANGELOG="DefaultTamerWeb/src/content/changelog/${VERSION}.md"
+          if [ -f "$CONTENT_CHANGELOG" ]; then
+            perl -i -pe "s/^version: \"9\.9\.9\"/version: \"${VERSION}\"/" "$CONTENT_CHANGELOG"
+            perl -i -ne "print unless /^isUnreleased: true/" "$CONTENT_CHANGELOG"
+          fi
+
+          # Update README.md download link to point at the new release
+          perl -i -pe "s|DefaultTamer-v[0-9]+\.[0-9]+\.[0-9]+\.dmg\]\(https://github\.com/0xdps/default-tamer/releases/download/v[0-9]+\.[0-9]+\.[0-9]+/DefaultTamer-v[0-9]+\.[0-9]+\.[0-9]+\.dmg\)|DefaultTamer-v${VERSION}.dmg](https://github.com/0xdps/default-tamer/releases/download/v${VERSION}/DefaultTamer-v${VERSION}.dmg)|g" README.md
+
+          git add DefaultTamerWeb/src/data/release.json CHANGELOG.md README.md ${CONTENT_CHANGELOG:-}
+          git diff --staged --quiet || git commit -m "chore: update website to v${VERSION} [skip ci]"
+          git push origin trunk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+
+      - name: Clean keychain
+        if: always()
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security delete-keychain $KEYCHAIN_PATH || true

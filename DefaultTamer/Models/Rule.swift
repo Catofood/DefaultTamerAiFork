@@ -1,0 +1,137 @@
+//
+//  Rule.swift
+//  Default Tamer
+//
+//  Routing rule definitions
+//
+
+import Foundation
+
+enum SaveRuleOption: String, Codable, CaseIterable {
+    case noSave   = "noSave"
+    case byApp    = "byApp"
+    case byDomain = "byDomain"
+    case byExact  = "byExact"
+
+    var displayName: String {
+        switch self {
+        case .noSave:   return "Don't save rule"
+        case .byApp:    return "By app"
+        case .byDomain: return "By domain (subdomains)"
+        case .byExact:  return "Exact domain"
+        }
+    }
+}
+
+enum RuleType: String, Codable, CaseIterable {
+    case sourceApp = "Source App"
+    case domain = "Domain"
+    case urlPattern = "URL Pattern"
+}
+
+enum DomainMatchType: String, Codable {
+    case exact = "Exact"
+    case suffix = "Suffix"
+    case contains = "Contains"
+}
+
+struct Rule: Identifiable, Codable, Hashable {
+    let id: UUID
+    var type: RuleType
+    var enabled: Bool
+    var targetBrowserId: String
+    var openInPrivateMode: Bool
+
+    // Match criteria (only one set will be used based on type)
+    var sourceAppBundleId: String?
+    var sourceAppName: String?
+
+    var domainPattern: String?
+    var domainMatchType: DomainMatchType?
+
+    var urlContains: String?
+    var urlRegex: String?
+    
+    init(
+        id: UUID = UUID(),
+        type: RuleType,
+        enabled: Bool = true,
+        targetBrowserId: String,
+        openInPrivateMode: Bool = false
+    ) {
+        self.id = id
+        self.type = type
+        self.enabled = enabled
+        self.targetBrowserId = targetBrowserId
+        self.openInPrivateMode = openInPrivateMode
+    }
+    
+    // Helper to get a human-readable description
+    func description(browsers: [Browser]) -> String {
+        let targetBrowser = browsers.first(where: { $0.id == targetBrowserId })?.displayName ?? "Unknown"
+        
+        switch type {
+        case .sourceApp:
+            let appName = sourceAppName ?? sourceAppBundleId ?? "Unknown"
+            return "From \(appName) → \(targetBrowser)"
+        case .domain:
+            let pattern = domainPattern ?? ""
+            let matchType = domainMatchType?.rawValue ?? "Exact"
+            return "Domain \(pattern) (\(matchType)) → \(targetBrowser)"
+        case .urlPattern:
+            let pattern = urlContains ?? urlRegex ?? ""
+            return "URL contains '\(pattern)' → \(targetBrowser)"
+        }
+    }
+    
+    // Factory methods for common rules
+    static func sourceAppRule(
+        appName: String,
+        targetBrowserId: String,
+        fallbackBundleId: String
+    ) -> Rule {
+        var rule = Rule(type: .sourceApp, targetBrowserId: targetBrowserId)
+        if let bundleId = AppResolver.resolveBundleId(forAppNamed: appName) {
+            rule.sourceAppBundleId = bundleId
+        } else {
+            rule.sourceAppBundleId = fallbackBundleId
+        }
+        rule.sourceAppName = appName
+        return rule
+    }
+    
+    static func slackRule(targetBrowserId: String) -> Rule {
+        return sourceAppRule(
+            appName: "Slack",
+            targetBrowserId: targetBrowserId,
+            fallbackBundleId: BundleIdentifiers.slack
+        )
+    }
+    
+    static func cursorRule(targetBrowserId: String) -> Rule {
+        return sourceAppRule(
+            appName: "Cursor",
+            targetBrowserId: targetBrowserId,
+            fallbackBundleId: "com.todesktop.230313mzl4w4u92"
+        )
+    }
+    
+    /// Updates bundle IDs for app-based rules with dynamic resolution
+    /// Returns true if bundle ID was updated
+    mutating func refreshBundleId() -> Bool {
+        guard type == .sourceApp,
+              let appName = sourceAppName else {
+            return false
+        }
+        
+        // Try to find updated bundle ID
+        if let newBundleId = AppResolver.refreshBundleId(forAppNamed: appName) {
+            if newBundleId != sourceAppBundleId {
+                sourceAppBundleId = newBundleId
+                return true
+            }
+        }
+        
+        return false
+    }
+}
